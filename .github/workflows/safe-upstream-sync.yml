@@ -1,0 +1,236 @@
+name: Safe upstream sync
+
+on:
+  schedule:
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: safe-upstream-sync
+  cancel-in-progress: false
+
+env:
+  BACKUP_REPO: adadsadadada/ZenlessZoneZero-OneDragon
+
+jobs:
+  sync:
+    if: github.repository == 'adadsadadada/ZenlessZoneZero-OneDragon' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPO: OneDragon-Anything/ZenlessZoneZero-OneDragon
+      UPSTREAM_ID: '811824730'
+      BACKUP_ID: '1446899786'
+      SNAPSHOT_SHA: 8da39a457384311066118282e756fd754b5999e0
+    steps:
+      - name: Check identities and snapshots, then merge safely
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import datetime as dt
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from typing import Any
+          
+          REPO = os.environ["BACKUP_REPO"]
+          UPSTREAM = os.environ["UPSTREAM_REPO"]
+          SNAPSHOT = "snapshot-2026-11-05"
+          EXPECTED_SHA = os.environ["SNAPSHOT_SHA"]
+          CHECKPOINT = "upstream-checkpoint"
+          AUDIT_PATH = ".github/upstream-backup-audit.json"
+          
+          
+          def api(path: str, method: str = "GET", data: dict[str, Any] | None = None) -> Any:
+              payload = json.dumps(data).encode() if data is not None else None
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{path}", data=payload, method=method,
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "safe-upstream-backup",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      raw = response.read()
+                      return json.loads(raw) if raw else None
+              except urllib.error.HTTPError as exc:
+                  raise RuntimeError(f"GitHub API {method} {path}: HTTP {exc.code}; sync stopped") from exc
+          
+          
+          def ref(kind: str, name: str) -> str:
+              obj = api(f"{REPO}/git/ref/{kind}/{name}")["object"]
+              if obj["type"] != "commit":
+                  raise RuntimeError(f"Expected a direct commit ref: {kind}/{name}")
+              return obj["sha"]
+          
+          
+          def check_snapshot() -> None:
+              for kind in ("heads", "tags"):
+                  if ref(kind, SNAPSHOT) != EXPECTED_SHA:
+                      raise RuntimeError("Fixed snapshot SHA changed; sync stopped")
+          
+          
+          def require_ancestor(repo: str, base: str, head: str) -> None:
+              if base == head:
+                  return
+              comparison = api(f"{repo}/compare/{base}...{head}")
+              if comparison["status"] not in ("ahead", "identical"):
+                  raise RuntimeError(f"History is not fast-forward: {base} -> {head}; sync stopped")
+          
+          
+          def entry(repo: str, commit: str, path: str) -> dict[str, Any] | None:
+              tree_sha = api(f"{repo}/git/commits/{commit}")["tree"]["sha"]
+              parts = path.split("/")
+              for index, part in enumerate(parts):
+                  tree = api(f"{repo}/git/trees/{tree_sha}")
+                  if tree.get("truncated"):
+                      raise RuntimeError("Incomplete Git tree; sync stopped")
+                  item = next((item for item in tree["tree"] if item["path"] == part), None)
+                  if item is None:
+                      return None
+                  if index == len(parts) - 1:
+                      return {key: item[key] for key in ("mode", "type", "sha")}
+                  if item["type"] != "tree":
+                      raise RuntimeError(f"Unexpected non-directory in {path}; sync stopped")
+                  tree_sha = item["sha"]
+              raise RuntimeError("Empty path")
+          
+          
+          def summary(message: str) -> None:
+              print(message, flush=True)
+              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
+                  stream.write(message + "\n\n")
+          
+          
+          def main() -> None:
+              if os.environ["GITHUB_REPOSITORY"] != REPO or os.environ["GITHUB_REF"] != "refs/heads/main":
+                  raise RuntimeError("Only the configured backup main branch may sync")
+              local = api(REPO)
+              upstream = api(UPSTREAM)
+              if (local["id"] != int(os.environ["BACKUP_ID"]) or not local["fork"]
+                      or local.get("parent", {}).get("id") != int(os.environ["UPSTREAM_ID"])
+                      or local.get("parent", {}).get("full_name") != UPSTREAM
+                      or upstream["id"] != int(os.environ["UPSTREAM_ID"])
+                      or upstream["full_name"] != UPSTREAM
+                      or upstream.get("archived") or upstream.get("disabled")
+                      or upstream["default_branch"] != "main" or local["default_branch"] != "main"):
+                  raise RuntimeError("Repository identity, fork parent or availability changed; sync stopped")
+          
+              check_snapshot()
+              original_main = ref("heads", "main")
+              checkpoint = ref("heads", CHECKPOINT)
+              candidate = api(f"{UPSTREAM}/git/ref/heads/main")["object"]["sha"]
+              require_ancestor(REPO, EXPECTED_SHA, checkpoint)
+              require_ancestor(REPO, checkpoint, original_main)
+              require_ancestor(UPSTREAM, checkpoint, candidate)
+          
+              # 上游工作流和本仓同步配置变化必须先审查。
+              for path in (".github/workflows", ".github/UPSTREAM_BACKUP.md", AUDIT_PATH):
+                  if entry(UPSTREAM, checkpoint, path) != entry(UPSTREAM, candidate, path):
+                      raise RuntimeError(f"Upstream changed protected automation path {path}; review required")
+          
+              if ref("heads", "main") != original_main or ref("heads", CHECKPOINT) != checkpoint:
+                  raise RuntimeError("Branch changed during preflight; retry required")
+              check_snapshot()
+              if candidate != checkpoint:
+                  api(f"{REPO}/merges", "POST", {
+                      "base": "main", "head": candidate,
+                      "commit_message": f"chore: merge reviewed upstream paths at {candidate}",
+                  })
+                  merged_main = ref("heads", "main")
+                  require_ancestor(REPO, original_main, merged_main)
+                  require_ancestor(REPO, candidate, merged_main)
+                  # 仅允许快进更新检查点，不允许覆盖或改写历史。
+                  api(f"{REPO}/git/refs/heads/{CHECKPOINT}", "PATCH", {"sha": candidate, "force": False})
+          
+              # 每28天保留一次检查记录，避免公开仓库60天无活动导致定时工作流被停用。
+              audit = api(f"{REPO}/contents/{AUDIT_PATH}?ref=main")
+              record = json.loads(base64.b64decode(audit["content"]))
+              now = dt.datetime.now(dt.timezone.utc)
+              last = dt.datetime.fromisoformat(record["checked_at"])
+              if now - last >= dt.timedelta(days=28):
+                  encoded = base64.b64encode(json.dumps(
+                      {"checked_at": now.isoformat(), "upstream_sha": candidate}, indent=2
+                  ).encode()).decode()
+                  api(f"{REPO}/contents/{AUDIT_PATH}", "PUT", {
+                      "branch": "main", "sha": audit["sha"],
+                      "message": "chore: record monthly upstream backup health check",
+                      "content": encoded,
+                  })
+          
+              check_snapshot()
+              final_main = ref("heads", "main")
+              require_ancestor(REPO, candidate, final_main)
+              if ref("heads", CHECKPOINT) != candidate:
+                  raise RuntimeError("Checkpoint verification failed")
+              latest = api(f"{UPSTREAM}/git/ref/heads/main")["object"]["sha"]
+              if latest != candidate:
+                  raise RuntimeError("Upstream changed during sync; rerun to include the new commit")
+              summary(f"Upstream: {UPSTREAM}\n\nUpstream main: {candidate}\n\nBackup main: {final_main}"
+                      f"\n\nFixed snapshot (branch and tag): {EXPECTED_SHA}"
+                      "\n\nVerified: non-destructive history, snapshot unchanged; no upstream scripts executed.")
+          
+          
+          try:
+              main()
+          except Exception as exc:
+              summary(f"::error::Upstream synchronization stopped: {exc}")
+              raise
+          PY
+
+  report-failure:
+    needs: sync
+    if: failure() && needs.sync.result == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Report the failure in this backup repository
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+          
+          repo = os.environ["BACKUP_REPO"]
+          url = f"https://api.github.com/repos/{repo}/issues"
+          headers = {
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "safe-upstream-backup",
+          }
+          title = "[upstream-sync] 自动同步已停止，需要检查"
+          run = f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          with urllib.request.urlopen(urllib.request.Request(url + "?state=open&per_page=100", headers=headers), timeout=60) as response:
+              existing = json.load(response)
+          if not any(issue["title"] == title for issue in existing):
+              body = (
+                  f"安全检查或非破坏性合并失败，本次同步已停止。请查看 [Actions 日志]({run})。"
+                  "\n\n可能原因：上游删除或不可访问、上游身份变化、历史被改写、合并冲突、"
+                  "上游工作流变化需要审查，或 GitHub 权限/服务异常。"
+                  "\n\n固定快照不在同步写入范围内。禁止强制推送或覆盖式重置。"
+                  "修复并验证后可关闭本 Issue；每日检查仍会继续。"
+              )
+              request = urllib.request.Request(url, headers=headers, method="POST",
+                  data=json.dumps({"title": title, "body": body}).encode())
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  print(json.load(response)["html_url"])
+          else:
+              print("An open synchronization alert already exists; inspect the latest failed Actions run.")
+          PY
