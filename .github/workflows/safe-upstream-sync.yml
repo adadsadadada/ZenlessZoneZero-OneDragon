@@ -135,10 +135,25 @@ jobs:
               require_ancestor(REPO, checkpoint, original_main)
               require_ancestor(UPSTREAM, checkpoint, candidate)
           
-              # 上游工作流和本仓同步配置变化必须先审查。
+              # 仅豁免已人工核验的单个上游提交；后续工作流变化继续拦截。
+              approved_commit = "60084153d4a63be17da7bc995eff9ea14efd25d1"
+              approved_path = ".github/workflows/build-release.yml"
               for path in (".github/workflows", ".github/UPSTREAM_BACKUP.md", AUDIT_PATH):
-                  if entry(UPSTREAM, checkpoint, path) != entry(UPSTREAM, candidate, path):
-                      raise RuntimeError(f"Upstream changed protected automation path {path}; review required")
+                  if entry(UPSTREAM, checkpoint, path) == entry(UPSTREAM, candidate, path):
+                      continue
+                  if path == ".github/workflows" and candidate == approved_commit:
+                      changes = api(f"{UPSTREAM}/compare/{checkpoint}...{candidate}")
+                      files = changes.get("files", [])
+                      if (changes.get("status") == "ahead"
+                              and changes.get("ahead_by") == 1
+                              and len(files) == 1
+                              and files[0]["filename"] == approved_path
+                              and files[0]["status"] == "modified"
+                              and files[0]["additions"] == 2
+                              and files[0]["deletions"] == 0):
+                          summary("Approved one-time release-note change: " + approved_commit)
+                          continue
+                  raise RuntimeError(f"Upstream changed protected automation path {path}; review required")
           
               if ref("heads", "main") != original_main or ref("heads", CHECKPOINT) != checkpoint:
                   raise RuntimeError("Branch changed during preflight; retry required")
